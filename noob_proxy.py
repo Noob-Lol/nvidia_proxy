@@ -64,14 +64,14 @@ async def proxy(request: web.Request):
             pass
 
     session: ClientSession = request.app["session"]
-
+    cors_headers = {"Access-Control-Allow-Credentials": "true", "Access-Control-Allow-Origin": "*"}
     if stream:
         async with session.post(url, data=body, headers=headers) as resp:
             if resp.status >= 400:
                 text = await resp.text()
                 return web.Response(text=text, status=resp.status, content_type=resp.content_type)
 
-            response = web.StreamResponse(status=resp.status, headers={"Content-Type": "text/event-stream"})
+            response = web.StreamResponse(status=resp.status, headers={**cors_headers, "Content-Type": "text/event-stream"})
             await response.prepare(request)
             async for chunk, _ in resp.content.iter_chunks():
                 if chunk:
@@ -81,7 +81,6 @@ async def proxy(request: web.Request):
     else:
         async with session.request(request.method, url, data=body, headers=headers) as resp:
             data = await resp.read()
-            cors_headers = {"Access-Control-Allow-Credentials": "true", "Access-Control-Allow-Origin": "*"}
             return web.Response(body=data, status=resp.status, content_type=resp.content_type, headers=cors_headers)
 
 
