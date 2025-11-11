@@ -47,6 +47,13 @@ async def proxy(request: web.Request):
     url = f"{NVIDIA_BASE}/{path}"
     headers = {k: v for k, v in request.headers.items() if k.lower() != "host"}
     body = await request.read()
+    # Handle preflight CORS
+    if request.method == "OPTIONS":
+        return web.Response(headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+        })
 
     stream = False
     if request.method == "POST":
