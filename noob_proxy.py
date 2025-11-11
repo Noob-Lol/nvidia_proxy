@@ -50,9 +50,10 @@ async def proxy(request: web.Request):
     # Handle preflight CORS
     if request.method == "OPTIONS":
         return web.Response(headers={
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+            "Access-Control-Allow-Credentials": "true",
             "Access-Control-Allow-Headers": "*",
+            "Access-Control-Allow-Methods": "DELETE, GET, HEAD, OPTIONS, PATCH, POST, PUT",
+            "Access-Control-Allow-Origin": "*",
         })
 
     stream = False
@@ -80,7 +81,8 @@ async def proxy(request: web.Request):
     else:
         async with session.request(request.method, url, data=body, headers=headers) as resp:
             data = await resp.read()
-            return web.Response(body=data, status=resp.status, content_type=resp.content_type)
+            cors_headers = {"Access-Control-Allow-Credentials": "true", "Access-Control-Allow-Origin": "*"}
+            return web.Response(body=data, status=resp.status, content_type=resp.content_type, headers=cors_headers)
 
 
 if __name__ == "__main__":
