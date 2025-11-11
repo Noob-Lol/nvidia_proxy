@@ -1,89 +1,80 @@
+import json
 import os
 
-import httpx
-from fastapi import FastAPI, Request, Response
-from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
+from aiohttp import ClientSession, TCPConnector, web
 
-app = FastAPI(title="OpenAI → NVIDIA Proxy")
-
-# NVIDIA API base (you can override with env if needed)
 NVIDIA_BASE = os.getenv("NVIDIA_API_URL", "https://integrate.api.nvidia.com/v1")
 
 
-@app.get("/health")
-async def health():
-    """Simple health check."""
-    return PlainTextResponse("ok")
+# We'll attach the session to the app object
+async def create_app():
+    app = web.Application()
+
+    # Create global session on startup
+    async def on_startup(app):
+        app["session"] = ClientSession(connector=TCPConnector(ttl_dns_cache=300, enable_cleanup_closed=True))
+        print("ClientSession created")
+
+    # Close it on shutdown
+    async def on_cleanup(app):
+        await app["session"].close()
+        print("ClientSession closed")
+
+    app.on_startup.append(on_startup)
+    app.on_cleanup.append(on_cleanup)
+
+    # Routes
+    async def root(_):
+        return web.Response(text="OpenAI-compatible NVIDIA proxy (aiohttp) running.")
+
+    async def health(_):
+        return web.Response(text="ok")
+
+    async def routes(_):
+        return web.json_response({"object": "list", "endpoints": ["/v1/models", "/v1/chat/completions"]})
+
+    app.router.add_get("/", root)
+    app.router.add_get("/health", health)
+    app.router.add_get("/v1", routes)
+    app.router.add_route("*", "/v1/{path:.*}", proxy)
+
+    return app
 
 
-@app.get("/v1")
-async def root_v1():
-    """Metadata endpoint for compatibility."""
-    return JSONResponse({"object": "list", "endpoints": ["/v1/models", "/v1/chat/completions"]})
-
-
-@app.get("/v1/models")
-async def models(request: Request):
-    """List available models (passthrough to NVIDIA)."""
-    headers = _forward_headers(request)
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.get(f"{NVIDIA_BASE}/models", headers=headers)
-        return Response(content=r.content, status_code=r.status_code, media_type=r.headers.get("content-type"))
-
-
-@app.api_route("/v1/{path:path}", methods=["GET", "POST"])
-async def proxy(request: Request, path: str):
-    """Proxy any /v1/* endpoint transparently to NVIDIA API."""
+async def proxy(request: web.Request):
+    """Transparent proxy handler"""
+    path = request.match_info.get("path", "")
     url = f"{NVIDIA_BASE}/{path}"
-    headers = _forward_headers(request)
-    body = await request.body()
+    headers = {k: v for k, v in request.headers.items() if k.lower() != "host"}
+    body = await request.read()
 
-    # Detect streaming request (client sets "stream": true)
     stream = False
     if request.method == "POST":
         try:
-            data = await request.json()
-            stream = bool(data.get("stream", False))
+            stream = json.loads(body).get("stream", False)
         except Exception:
             pass
 
-    async with httpx.AsyncClient(timeout=None) as client:
-        if stream:
-            # Stream response (Server-Sent Events passthrough)
-            async with client.stream(request.method, url, headers=headers, content=body) as r:
-                return StreamingResponse(
-                    _iter_stream(r),
-                    media_type=r.headers.get("content-type", "text/event-stream"),
-                    status_code=r.status_code,
-                )
-        else:
-            # Regular JSON response
-            r = await client.request(request.method, url, headers=headers, content=body)
-            return Response(
-                content=r.content,
-                status_code=r.status_code,
-                media_type=r.headers.get("content-type"),
-            )
+    session: ClientSession = request.app["session"]
+
+    if stream:
+        async with session.post(url, data=body, headers=headers) as resp:
+            if resp.status >= 400:
+                text = await resp.text()
+                return web.Response(text=text, status=resp.status, content_type=resp.content_type)
+
+            response = web.StreamResponse(status=resp.status, headers={"Content-Type": "text/event-stream"})
+            await response.prepare(request)
+            async for chunk, _ in resp.content.iter_chunks():
+                if chunk:
+                    await response.write(chunk)
+            await response.write_eof()
+            return response
+    else:
+        async with session.request(request.method, url, data=body, headers=headers) as resp:
+            data = await resp.read()
+            return web.Response(body=data, status=resp.status, content_type=resp.content_type)
 
 
-def _forward_headers(request: Request) -> dict:
-    """Forward headers, ensuring BYOK (user-provided Authorization)."""
-    headers = {
-        "Content-Type": request.headers.get("content-type", "application/json"),
-    }
-    auth = request.headers.get("authorization")
-    if auth:
-        headers["Authorization"] = auth
-    return headers
-
-
-async def _iter_stream(response: httpx.Response):
-    """Stream event chunks from NVIDIA → client."""
-    async for chunk in response.aiter_bytes():
-        yield chunk
-
-
-# Optional root
-@app.get("/")
-async def index():
-    return PlainTextResponse("OpenAI-compatible NVIDIA proxy is running.")
+if __name__ == "__main__":
+    web.run_app(create_app(), host="0.0.0.0", port=8007)
