@@ -4,15 +4,17 @@ import os
 from aiohttp import ClientSession, TCPConnector, web
 
 NVIDIA_BASE = os.getenv("NVIDIA_API_URL", "https://integrate.api.nvidia.com/v1")
+PORT = int(os.getenv("PORT", 8007))
+ALLOWED_METHODS = "DELETE, GET, HEAD, OPTIONS, PATCH, POST, PUT"
 
 
 # We'll attach the session to the app object
 async def create_app():
-    app = web.Application()
+    app = web.Application(middlewares=[cors_middleware])
 
     # Create global session on startup
     async def on_startup(app):
-        app["session"] = ClientSession(connector=TCPConnector(ttl_dns_cache=300, enable_cleanup_closed=True))
+        app["session"] = ClientSession(connector=TCPConnector(ttl_dns_cache=300))
         print("ClientSession created")
 
     # Close it on shutdown
@@ -36,9 +38,47 @@ async def create_app():
     app.router.add_get("/", root)
     app.router.add_get("/health", health)
     app.router.add_get("/v1", routes)
+    app.router.add_route("OPTIONS", "/{path:.*}", options_handler)
     app.router.add_route("*", "/v1/{path:.*}", proxy)
 
     return app
+
+
+@web.middleware
+async def cors_middleware(request: web.Request, handler):
+    response = await handler(request)
+
+    origin = request.headers.get("Origin")
+    if origin:
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Vary"] = "Origin"
+
+    return response
+
+
+async def options_handler(request: web.Request):
+    origin = request.headers.get("Origin")
+    req_method = request.headers.get("Access-Control-Request-Method")
+
+    # Not a CORS preflight → let aiohttp routing decide
+    if not origin or not req_method:
+        raise web.HTTPMethodNotAllowed(
+            method="OPTIONS",
+            allowed_methods=ALLOWED_METHODS.split(", "),
+        )
+
+    headers = {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": ALLOWED_METHODS,
+        "Vary": "Origin",
+    }
+
+    # Echo requested headers if present
+    req_headers = request.headers.get("Access-Control-Request-Headers")
+    if req_headers:
+        headers["Access-Control-Allow-Headers"] = req_headers
+
+    return web.Response(status=204, headers=headers)
 
 
 async def proxy(request: web.Request):
@@ -47,31 +87,20 @@ async def proxy(request: web.Request):
     url = f"{NVIDIA_BASE}/{path}"
     headers = {k: v for k, v in request.headers.items() if k.lower() != "host"}
     body = await request.read()
-    # Handle preflight CORS
-    if request.method == "OPTIONS":
-        return web.Response(headers={
-            "Access-Control-Allow-Credentials": "true",
-            "Access-Control-Allow-Headers": "*",
-            "Access-Control-Allow-Methods": "DELETE, GET, HEAD, OPTIONS, PATCH, POST, PUT",
-            "Access-Control-Allow-Origin": "*",
-        })
-
     stream = False
     if request.method == "POST":
         try:
             stream = json.loads(body).get("stream", False)
         except Exception:
-            pass
-
+            stream = False
     session: ClientSession = request.app["session"]
-    cors_headers = {"Access-Control-Allow-Credentials": "true", "Access-Control-Allow-Origin": "*"}
     if stream:
         async with session.post(url, data=body, headers=headers) as resp:
             if resp.status >= 400:
                 text = await resp.text()
                 return web.Response(text=text, status=resp.status, content_type=resp.content_type)
 
-            response = web.StreamResponse(status=resp.status, headers={**cors_headers, "Content-Type": "text/event-stream"})
+            response = web.StreamResponse(status=resp.status, headers={"Content-Type": "text/event-stream"})
             await response.prepare(request)
             async for chunk, _ in resp.content.iter_chunks():
                 if chunk:
@@ -81,8 +110,8 @@ async def proxy(request: web.Request):
     else:
         async with session.request(request.method, url, data=body, headers=headers) as resp:
             data = await resp.read()
-            return web.Response(body=data, status=resp.status, content_type=resp.content_type, headers=cors_headers)
+            return web.Response(body=data, status=resp.status, content_type=resp.content_type)
 
 
 if __name__ == "__main__":
-    web.run_app(create_app(), host="0.0.0.0", port=8007)
+    web.run_app(create_app(), host="0.0.0.0", port=PORT)
