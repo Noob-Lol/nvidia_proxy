@@ -50,6 +50,9 @@ async def create_app():
 @web.middleware
 async def cors_middleware(request: web.Request, handler):
     response = await handler(request)
+    # If the response is already prepared (like in streaming), we can't modify headers
+    if response.prepared:
+        return response
 
     origin = request.headers.get("Origin")
     if origin:
@@ -113,6 +116,11 @@ async def do_chat_completion(request: web.Request):
                 return web.Response(text=text, status=resp.status, content_type=resp.content_type)
 
             response = web.StreamResponse(status=resp.status, headers={"Content-Type": "text/event-stream"})
+            # middleware doesn't work for streaming
+            origin = request.headers.get("Origin")
+            if origin:
+                response.headers["Access-Control-Allow-Origin"] = "*"
+                response.headers["Vary"] = "Origin"
             await response.prepare(request)
             async for chunk, _ in resp.content.iter_chunks():
                 if chunk:
