@@ -1,11 +1,11 @@
 import json
 import os
+from functools import partial
 
 from aiohttp import ClientSession, TCPConnector, web
 
 NVIDIA_BASE = os.getenv("NVIDIA_API_URL", "https://integrate.api.nvidia.com/v1")
 PORT = int(os.getenv("PORT", 8007))
-ALLOWED_METHODS = "DELETE, GET, HEAD, OPTIONS, PATCH, POST, PUT"
 
 
 # We'll attach the session to the app object
@@ -32,15 +32,18 @@ async def create_app():
     async def health(_):
         return web.Response(text="ok")
 
-    async def routes(_):
+    async def route_list(_):
         return web.json_response({"object": "list", "endpoints": ["/v1/models", "/v1/chat/completions"]})
 
-    app.router.add_get("/", root)
-    app.router.add_get("/health", health)
-    app.router.add_get("/v1", routes)
-    app.router.add_route("OPTIONS", "/{path:.*}", options_handler)
-    app.router.add_route("*", "/v1/{path:.*}", proxy)
-
+    partial_options_get = partial(options_handler, methods="GET")
+    get_routes_dict = {"/": root, "/health": health, "/v1": route_list, "/v1/models": proxy}
+    for route, handler in get_routes_dict.items():
+        app.router.add_get(route, handler)
+        app.router.add_options(route, partial_options_get)
+    partial_options_post = partial(options_handler, methods="POST")
+    app.router.add_post("/v1/chat/completions", proxy)
+    app.router.add_options("/v1/chat/completions", partial_options_post)
+    # we don't need more routes.
     return app
 
 
@@ -56,7 +59,10 @@ async def cors_middleware(request: web.Request, handler):
     return response
 
 
-async def options_handler(request: web.Request):
+async def options_handler(request: web.Request, methods=""):
+    """CORS preflight handler"""
+    # idk if options is needed, but I will add it
+    methods += ", OPTIONS" if methods else "OPTIONS"
     origin = request.headers.get("Origin")
     req_method = request.headers.get("Access-Control-Request-Method")
 
@@ -64,12 +70,12 @@ async def options_handler(request: web.Request):
     if not origin or not req_method:
         raise web.HTTPMethodNotAllowed(
             method="OPTIONS",
-            allowed_methods=ALLOWED_METHODS.split(", "),
+            allowed_methods=methods.split(", "),
         )
 
     headers = {
         "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": ALLOWED_METHODS,
+        "Access-Control-Allow-Methods": methods,
         "Vary": "Origin",
     }
 
