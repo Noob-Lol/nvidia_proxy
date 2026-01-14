@@ -30,19 +30,19 @@ async def create_app():
         return web.Response(text="OpenAI-compatible NVIDIA proxy (aiohttp) running.")
 
     async def health(_):
-        return web.Response(text="ok")
+        return web.Response(text="OK")
 
-    async def route_list(_):
-        return web.json_response({"object": "list", "endpoints": ["/v1/models", "/v1/chat/completions"]})
+    async def list_routes(_):
+        return web.json_response({"object": "list", "endpoints": ["/v1/models", chat_route]})
 
     partial_options_get = partial(options_handler, methods="GET")
-    get_routes_dict = {"/": root, "/health": health, "/v1": route_list, "/v1/models": proxy}
+    get_routes_dict = {"/": root, "/health": health, "/v1": list_routes, "/v1/models": list_models}
     for route, handler in get_routes_dict.items():
-        app.router.add_get(route, handler)
-        app.router.add_options(route, partial_options_get)
+        app.add_routes([web.get(route, handler), web.options(route, partial_options_get)])
+
+    chat_route = "/v1/chat/completions"
     partial_options_post = partial(options_handler, methods="POST")
-    app.router.add_post("/v1/chat/completions", proxy)
-    app.router.add_options("/v1/chat/completions", partial_options_post)
+    app.add_routes([web.post(chat_route, do_chat_completion), web.options(chat_route, partial_options_post)])
     # we don't need more routes.
     return app
 
@@ -87,18 +87,24 @@ async def options_handler(request: web.Request, methods=""):
     return web.Response(status=204, headers=headers)
 
 
-async def proxy(request: web.Request):
-    """Transparent proxy handler"""
-    path = request.match_info.get("path", "")
-    url = f"{NVIDIA_BASE}/{path}"
-    headers = {k: v for k, v in request.headers.items() if k.lower() != "host"}
+async def list_models(request: web.Request):
+    session: ClientSession = request.app["session"]
+    url = f"{NVIDIA_BASE}/models"
+    headers = {k: v for k, v in request.headers.items() if k.lower() not in {"host", "content-length"}}
+    async with session.get(url, headers=headers) as resp:
+        data = await resp.read()
+        return web.Response(body=data, status=resp.status, content_type=resp.content_type)
+
+
+async def do_chat_completion(request: web.Request):
+    """Does a post to chat/completions, returns a response"""
+    url = f"{NVIDIA_BASE}/chat/completions"
+    headers = {k: v for k, v in request.headers.items() if k.lower() not in {"host", "content-length"}}
     body = await request.read()
-    stream = False
-    if request.method == "POST":
-        try:
-            stream = json.loads(body).get("stream", False)
-        except Exception:
-            stream = False
+    try:
+        stream = json.loads(body).get("stream", False)
+    except Exception:
+        stream = False
     session: ClientSession = request.app["session"]
     if stream:
         async with session.post(url, data=body, headers=headers) as resp:
@@ -114,7 +120,7 @@ async def proxy(request: web.Request):
             await response.write_eof()
             return response
     else:
-        async with session.request(request.method, url, data=body, headers=headers) as resp:
+        async with session.post(url, data=body, headers=headers) as resp:
             data = await resp.read()
             return web.Response(body=data, status=resp.status, content_type=resp.content_type)
 
