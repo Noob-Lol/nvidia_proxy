@@ -1,137 +1,134 @@
-import json
+import logging
 import os
-from functools import partial
+from urllib.parse import urlparse
 
-from aiohttp import ClientSession, TCPConnector, web
+from aiohttp import ClientConnectorError, ClientResponse, ClientSession, ClientTimeout, InvalidURL, TCPConnector, web
 
-NVIDIA_BASE = os.getenv("NVIDIA_API_URL", "https://integrate.api.nvidia.com/v1")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)s: %(message)s",  # Removes timestamps and logger names
+)
+logger = logging.getLogger(__name__)
+# Headers that should not be forwarded (Hop-by-hop)
+HOP_BY_HOP = {
+    "connection", "keep-alive", "proxy-authenticate",
+    "proxy-authorization", "te", "trailers",
+    "transfer-encoding", "upgrade", "content-length",
+}
 PORT = int(os.getenv("PORT", 8007))
 
 
-# We'll attach the session to the app object
-async def create_app():
-    app = web.Application(middlewares=[cors_middleware])
+async def process_response(response: ClientResponse, request: web.Request) -> web.StreamResponse:
+    proxy_resp = web.StreamResponse(status=response.status, reason=response.reason)
+    # Copy relevant headers from target, then add CORS
+    for k, v in response.headers.items():
+        if k.lower() not in HOP_BY_HOP:
+            proxy_resp.headers[k] = v
 
-    # Create global session on startup
-    async def on_startup(app):
-        app["session"] = ClientSession(connector=TCPConnector(ttl_dns_cache=300))
-        print("ClientSession created")
+    proxy_resp.headers["Access-Control-Allow-Origin"] = "*"
+    await proxy_resp.prepare(request)
 
-    # Close it on shutdown
-    async def on_cleanup(app):
-        await app["session"].close()
-        print("ClientSession closed")
+    # 5. Defensive Streaming (The "Closed Transport" Fix)
+    try:
+        async for chunk in response.content.iter_any():
+            await proxy_resp.write(chunk)
+    except (ConnectionResetError, BrokenPipeError):
+        # This happens if the user closes the tab or cancels the request
+        logger.info("Client disconnected prematurely.")
+    except Exception:
+        logger.exception("Error during stream:")
+    else:
+        # write EOF only if no exceptions
+        await proxy_resp.write_eof()
+    return proxy_resp
+
+
+async def proxy_handler(request: web.Request):
+    # 1. Extract the target URL from the path
+    # Usage: http://localhost:8080/https://api.example.com/data
+    target_url = request.match_info.get("url")
+
+    if not target_url or target_url == "":
+        return web.Response(text="CORS Proxy Active", status=200)
+
+    parsed = urlparse(target_url)
+    if not all([parsed.scheme, parsed.netloc]):
+        return web.Response(
+            text=f"Invalid URL: '{target_url}'. Ensure it includes the scheme (e.g., https://).",
+            status=400,
+        )
+
+    host_header = request.host  # e.g., 'localhost:8080' or 'proxy.com'
+    if host_header in target_url:
+        return web.Response(text="Recursive proxy calls are forbidden.", status=403)
+
+    # 2. Handle CORS Preflight (OPTIONS)
+    # We intercept this to tell the browser "Yes, we allow everything."
+    if request.method == "OPTIONS":
+        return web.Response(status=200, headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "*",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Max-Age": "86400",
+        })
+    # Simple "Request Received" log
+    logger.info("--> %s %s", request.method, target_url)
+
+    # 3. Prepare headers to forward
+    # We strip 'Host' because the target server expects its own host header
+    headers = {k: v for k, v in request.headers.items() if k.lower() not in HOP_BY_HOP and k.lower() != "host"}
+
+    try:
+        session: ClientSession = request.app["client_session"]
+        # 4. Timeout Strategy
+        # total=None: Allow streams to run for hours if needed.
+        # connect=10: Kill if we can't connect to target within 10s.
+        # sock_read=60: Kill if the server stops sending data for 60s.
+        timeout = ClientTimeout(total=None, connect=10, sock_read=60)
+
+        async with session.request(
+            method=request.method,
+            url=target_url,
+            headers=headers,
+            data=request.content if request.can_read_body else None,
+            allow_redirects=True,
+            timeout=timeout,
+        ) as target_resp:
+            # Simple "Response Sent" log
+            logger.info("<-- %s %s", target_resp.status, target_url)
+            return await process_response(target_resp, request)
+    except InvalidURL:
+        err, status = "Invalid URL", 400
+    except ClientConnectorError:
+        err, status = "Target host unreachable.", 504
+    except Exception as e:
+        logger.exception("Proxy error:")
+        err, status = str(e), 502
+    return web.Response(text=err, status=status)
+
+
+async def on_startup(app):
+    # Reuse a single session for all outgoing requests
+    connector = TCPConnector(limit=0)
+    app["client_session"] = ClientSession(connector=connector, auto_decompress=False)
+    logger.info("ClientSession created")
+
+
+async def on_cleanup(app):
+    await app["client_session"].close()
+    logger.info("ClientSession closed")
+
+
+def main():
+    app = web.Application(client_max_size=1024**3 * 5)  # 5GB, pls don't abuse...
+    # Capture everything after the first slash as the URL
+    app.router.add_route("*", "/{url:.*}", proxy_handler)
 
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
 
-    # Routes
-    async def root(_):
-        return web.Response(text="OpenAI-compatible NVIDIA proxy (aiohttp) running.")
-
-    async def health(_):
-        return web.Response(text="OK")
-
-    async def list_routes(_):
-        return web.json_response({"object": "list", "endpoints": ["/v1/models", chat_route]})
-
-    partial_options_get = partial(options_handler, methods="GET")
-    get_routes_dict = {"/": root, "/health": health, "/v1": list_routes, "/v1/models": list_models}
-    for route, handler in get_routes_dict.items():
-        app.add_routes([web.get(route, handler), web.options(route, partial_options_get)])
-
-    chat_route = "/v1/chat/completions"
-    partial_options_post = partial(options_handler, methods="POST")
-    app.add_routes([web.post(chat_route, do_chat_completion), web.options(chat_route, partial_options_post)])
-    # we don't need more routes.
-    return app
-
-
-@web.middleware
-async def cors_middleware(request: web.Request, handler):
-    response = await handler(request)
-    # If the response is already prepared (like in streaming), we can't modify headers
-    if response.prepared:
-        return response
-
-    origin = request.headers.get("Origin")
-    if origin:
-        response.headers["Access-Control-Allow-Origin"] = "*"
-        response.headers["Vary"] = "Origin"
-
-    return response
-
-
-async def options_handler(request: web.Request, methods=""):
-    """CORS preflight handler"""
-    # idk if options is needed, but I will add it
-    methods += ", OPTIONS" if methods else "OPTIONS"
-    origin = request.headers.get("Origin")
-    req_method = request.headers.get("Access-Control-Request-Method")
-
-    # Not a CORS preflight → let aiohttp routing decide
-    if not origin or not req_method:
-        raise web.HTTPMethodNotAllowed(
-            method="OPTIONS",
-            allowed_methods=methods.split(", "),
-        )
-
-    headers = {
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": methods,
-        "Vary": "Origin",
-    }
-
-    # Echo requested headers if present
-    req_headers = request.headers.get("Access-Control-Request-Headers")
-    if req_headers:
-        headers["Access-Control-Allow-Headers"] = req_headers
-
-    return web.Response(status=204, headers=headers)
-
-
-async def list_models(request: web.Request):
-    session: ClientSession = request.app["session"]
-    url = f"{NVIDIA_BASE}/models"
-    headers = {k: v for k, v in request.headers.items() if k.lower() not in {"host", "content-length"}}
-    async with session.get(url, headers=headers) as resp:
-        data = await resp.read()
-        return web.Response(body=data, status=resp.status, content_type=resp.content_type)
-
-
-async def do_chat_completion(request: web.Request):
-    """Does a post to chat/completions, returns a response"""
-    url = f"{NVIDIA_BASE}/chat/completions"
-    headers = {k: v for k, v in request.headers.items() if k.lower() not in {"host", "content-length"}}
-    body = await request.read()
-    try:
-        stream = json.loads(body).get("stream", False)
-    except Exception:
-        stream = False
-    session: ClientSession = request.app["session"]
-    if stream:
-        async with session.post(url, data=body, headers=headers) as resp:
-            if resp.status >= 400:
-                text = await resp.text()
-                return web.Response(text=text, status=resp.status, content_type=resp.content_type)
-
-            response = web.StreamResponse(status=resp.status, headers={"Content-Type": "text/event-stream"})
-            # middleware doesn't work for streaming
-            origin = request.headers.get("Origin")
-            if origin:
-                response.headers["Access-Control-Allow-Origin"] = "*"
-                response.headers["Vary"] = "Origin"
-            await response.prepare(request)
-            async for chunk, _ in resp.content.iter_chunks():
-                if chunk:
-                    await response.write(chunk)
-            await response.write_eof()
-            return response
-    else:
-        async with session.post(url, data=body, headers=headers) as resp:
-            data = await resp.read()
-            return web.Response(body=data, status=resp.status, content_type=resp.content_type)
+    web.run_app(app, port=PORT, access_log=None)
 
 
 if __name__ == "__main__":
-    web.run_app(create_app(), host="0.0.0.0", port=PORT)
+    main()
